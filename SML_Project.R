@@ -113,6 +113,35 @@ str(all_themes_wide)
 all_factors_wide <- all_factors_wide[-1,]
 all_themes_wide <- all_themes_wide[-1,]
 
+################################################################################
+### Get Colnames For Different Predictor Sets (FF5, All Themes, All Factors) ###
+################################################################################
+
+# Get theme names for the second analysis (Analysis 2)
+# We get the column names *before* the merge, excluding 'date'
+theme_names <- all_themes_wide %>% 
+  select(-date) %>% 
+  colnames()
+
+# Add the '_lag1' suffix to match the predictor names in 'final_data'
+theme_predictors_lagged <- paste0(theme_names, "_lag1")
+
+print("Theme predictors for Analysis 2 identified:")
+print(theme_predictors_lagged)
+
+# Get factor names for the second analysis (Analysis 3)
+# We get the column names *before* the merge, excluding 'date'
+factor_names <- all_factors_wide %>% 
+  select(-date) %>% 
+  colnames()
+
+# Add the '_lag1' suffix to match the predictor names in 'final_data'
+factor_predictors_lagged <- paste0(factor_names, "_lag1")
+
+print("Factor predictors for Analysis 3 identified:")
+print(factor_predictors_lagged)
+
+
 ###########################################
 ### Merge All Data into a Master Tibble ###
 ###########################################
@@ -247,8 +276,264 @@ mse_rf <- mean((y_test - preds_rf)^2)
 
 # --- 10. Compare Final Performance ---
 results <- tibble(
-  Model = c("OLS (Baseline)", "Elastic Net (Tuned)", "Random Forest"),
-  Test_MSE = c(mse_ols, mse_enet, mse_rf)
+ Model = c("OLS (All Predictors)", "Elastic Net (All Predictors)", "Random Forest (All Predictors)"),
+ Test_MSE = c(mse_ols, mse_enet, mse_rf)
 )
 
+print("--- ANALYSIS 1: ALL PREDICTORS ---")
 print(results)
+
+
+###################################################
+### --- ANALYSIS 2: THEME-ONLY PREDICTORS --- ###
+###################################################
+
+# --- 9-B. Create Theme-Only Data Subsets ---
+
+# Create data frames for lm() and ranger() formula interface
+# We select the target variable + our list of theme predictors
+train_data_themes <- train_data_proc %>% 
+  select(sp500_excess, all_of(theme_predictors_lagged))
+test_data_themes <- test_data_proc %>% 
+  select(sp500_excess, all_of(theme_predictors_lagged))
+  
+# Create matrices for glmnet() by subsetting the original matrices
+# We use 'drop = FALSE' to ensure it stays a matrix even if there's one predictor
+x_train_themes <- x_train[, theme_predictors_lagged, drop = FALSE]
+x_val_themes   <- x_val[, theme_predictors_lagged, drop = FALSE]
+x_test_themes  <- x_test[, theme_predictors_lagged, drop = FALSE]
+
+# The Y variables (y_train, y_val, y_test) are the same
+
+
+# --- 10-B. Fit Theme-Only Models ---
+
+### Fit OLS on the THEME Data ###
+ols_model_themes <- lm(sp500_excess ~ ., data = train_data_themes)
+
+### Tune Elastic Net on THEME Data ###
+alphas_to_try <- c(0, 0.5, 1) 
+best_mse_themes <- Inf
+best_model_themes <- NULL
+
+for (a in alphas_to_try) {
+  # 1. Fit on TRAINING data
+  cv_fit_themes <- cv.glmnet(x_train_themes, y_train, alpha = a, family = "gaussian")
+  
+  # 2. Predict on VALIDATION data
+  preds_val_themes <- predict(cv_fit_themes, newx = x_val_themes, s = "lambda.min")
+  
+  # 3. Calculate MSE on VALIDATION data
+  mse_val_themes <- mean((y_val - preds_val_themes)^2)
+  
+  # 4. Keep the best model
+  if (mse_val_themes < best_mse_themes) {
+    best_mse_themes   <- mse_val_themes
+    best_model_themes <- cv_fit_themes
+  }
+}
+
+print(paste("Best Alpha (Themes):", best_model_themes$glmnet.fit$alpha))
+print(paste("Best Lambda (Themes):", best_model_themes$lambda.min))
+
+### Fit Random Forest on THEME Data ###
+rf_model_themes <- ranger(
+  formula   = sp500_excess ~ ., 
+  data      = train_data_themes,
+  num.trees = 500,
+  # Adjust mtry based on the new, smaller number of predictors
+  mtry      = floor(ncol(x_train_themes) / 3) 
+)
+
+# --- 11-B. Assess Theme-Only Models on TEST Data ---
+
+# 1. OLS Predictions (Themes)
+preds_ols_themes <- predict(ols_model_themes, newdata = test_data_themes)
+mse_ols_themes <- mean((y_test - preds_ols_themes)^2)
+
+# 2. Elastic Net Predictions (Themes)
+preds_enet_themes <- predict(best_model_themes, newx = x_test_themes, s = "lambda.min")
+mse_enet_themes <- mean((y_test - preds_enet_themes)^2)
+
+# 3. Random Forest Predictions (Themes)
+preds_rf_themes <- predict(rf_model_themes, data = test_data_themes)$predictions
+mse_rf_themes <- mean((y_test - preds_rf_themes)^2)
+
+# --- 12-B. Compare Final Performance (Themes) ---
+results_themes <- tibble(
+  Model = c("OLS (Themes)", "Elastic Net (Themes)", "Random Forest (Themes)"),
+  Test_MSE = c(mse_ols_themes, mse_enet_themes, mse_rf_themes)
+)
+
+print("--- ANALYSIS 2: THEME-ONLY PREDICTORS ---")
+print(results_themes)
+
+
+##################################################
+### --- ANALYSIS 3: ALL-FACTORS PREDICTORS --- ###
+##################################################
+
+# --- 9-B. Create Factor-Only Data Subsets ---
+
+# Create data frames for lm() and ranger() formula interface
+# We select the target variable + our list of theme predictors
+train_data_factors <- train_data_proc %>% 
+  select(sp500_excess, all_of(factor_predictors_lagged))
+test_data_factors <- test_data_proc %>% 
+  select(sp500_excess, all_of(factor_predictors_lagged))
+  
+# Create matrices for glmnet() by subsetting the original matrices
+# We use 'drop = FALSE' to ensure it stays a matrix even if there's one predictor
+x_train_factors <- x_train[, theme_predictors_lagged, drop = FALSE]
+x_val_factors   <- x_val[, theme_predictors_lagged, drop = FALSE]
+x_test_themes  <- x_test[, theme_predictors_lagged, drop = FALSE]
+
+# The Y variables (y_train, y_val, y_test) are the same
+
+
+# --- 10-B. Fit Theme-Only Models ---
+
+### Fit OLS on the THEME Data ###
+ols_model_themes <- lm(sp500_excess ~ ., data = train_data_themes)
+
+### Tune Elastic Net on THEME Data ###
+alphas_to_try <- c(0, 0.5, 1) 
+best_mse_themes <- Inf
+best_model_themes <- NULL
+
+for (a in alphas_to_try) {
+  # 1. Fit on TRAINING data
+  cv_fit_themes <- cv.glmnet(x_train_themes, y_train, alpha = a, family = "gaussian")
+  
+  # 2. Predict on VALIDATION data
+  preds_val_themes <- predict(cv_fit_themes, newx = x_val_themes, s = "lambda.min")
+  
+  # 3. Calculate MSE on VALIDATION data
+  mse_val_themes <- mean((y_val - preds_val_themes)^2)
+  
+  # 4. Keep the best model
+  if (mse_val_themes < best_mse_themes) {
+    best_mse_themes   <- mse_val_themes
+    best_model_themes <- cv_fit_themes
+  }
+}
+
+print(paste("Best Alpha (Themes):", best_model_themes$glmnet.fit$alpha))
+print(paste("Best Lambda (Themes):", best_model_themes$lambda.min))
+
+### Fit Random Forest on THEME Data ###
+rf_model_themes <- ranger(
+  formula   = sp500_excess ~ ., 
+  data      = train_data_themes,
+  num.trees = 500,
+  # Adjust mtry based on the new, smaller number of predictors
+  mtry      = floor(ncol(x_train_themes) / 3) 
+)
+
+# --- 11-B. Assess Theme-Only Models on TEST Data ---
+
+# 1. OLS Predictions (Themes)
+preds_ols_themes <- predict(ols_model_themes, newdata = test_data_themes)
+mse_ols_themes <- mean((y_test - preds_ols_themes)^2)
+
+# 2. Elastic Net Predictions (Themes)
+preds_enet_themes <- predict(best_model_themes, newx = x_test_themes, s = "lambda.min")
+mse_enet_themes <- mean((y_test - preds_enet_themes)^2)
+
+# 3. Random Forest Predictions (Themes)
+preds_rf_themes <- predict(rf_model_themes, data = test_data_themes)$predictions
+mse_rf_themes <- mean((y_test - preds_rf_themes)^2)
+
+# --- 12-B. Compare Final Performance (Themes) ---
+results_themes <- tibble(
+  Model = c("OLS (Themes)", "Elastic Net (Themes)", "Random Forest (Themes)"),
+  Test_MSE = c(mse_ols_themes, mse_enet_themes, mse_rf_themes)
+)
+
+print("--- ANALYSIS 2: THEME-ONLY PREDICTORS ---")
+print(results_themes)
+
+
+
+#####################################################
+### --- ANALYSIS 3: FACTOR-ONLY PREDICTORS --- ###
+#####################################################
+
+# --- 9-C. Create Factor-Only Data Subsets ---
+
+# Create data frames for lm() and ranger() formula interface
+# We select the target variable + our list of factor predictors
+train_data_factors <- train_data_proc %>% 
+  select(sp500_excess, all_of(factor_predictors_lagged))
+test_data_factors <- test_data_proc %>% 
+  select(sp500_excess, all_of(factor_predictors_lagged))
+  
+# Create matrices for glmnet() by subsetting the original matrices
+x_train_factors <- x_train[, factor_predictors_lagged, drop = FALSE]
+x_val_factors   <- x_val[, factor_predictors_lagged, drop = FALSE]
+x_test_factors  <- x_test[, factor_predictors_lagged, drop = FALSE]
+
+# The Y variables (y_train, y_val, y_test) are the same
+
+
+# --- 10-C. Fit Factor-Only Models ---
+
+### Fit OLS on the FACTOR Data ###
+ols_model_factors <- lm(sp500_excess ~ ., data = train_data_factors)
+
+### Tune Elastic Net on FACTOR Data ###
+alphas_to_try <- c(0, 0.5, 1) 
+best_mse_factors <- Inf
+best_model_factors <- NULL
+
+for (a in alphas_to_try) {
+  # 1. Fit on TRAINING data
+  cv_fit_factors <- cv.glmnet(x_train_factors, y_train, alpha = a, family = "gaussian")
+  
+  # 2. Predict on VALIDATION data
+  preds_val_factors <- predict(cv_fit_factors, newx = x_val_factors, s = "lambda.min")
+  
+  # 3. Calculate MSE on VALIDATION data
+  mse_val_factors <- mean((y_val - preds_val_factors)^2)
+  
+  # 4. Keep the best model
+  if (mse_val_factors < best_mse_factors) {
+    best_mse_factors   <- mse_val_factors
+    best_model_factors <- cv_fit_factors
+  }
+}
+
+print(paste("Best Alpha (Factors):", best_model_factors$glmnet.fit$alpha))
+print(paste("Best Lambda (Factors):", best_model_factors$lambda.min))
+
+### Fit Random Forest on FACTOR Data ###
+rf_model_factors <- ranger(
+  formula   = sp500_excess ~ ., 
+  data      = train_data_factors,
+  num.trees = 500,
+  # Adjust mtry based on the new, smaller number of predictors
+  mtry      = floor(ncol(x_train_factors) / 3) 
+)
+
+# --- 11-C. Assess Factor-Only Models on TEST Data ---
+
+# 1. OLS Predictions (Factors)
+preds_ols_factors <- predict(ols_model_factors, newdata = test_data_factors)
+mse_ols_factors <- mean((y_test - preds_ols_factors)^2)
+
+# 2. Elastic Net Predictions (Factors)
+preds_enet_factors <- predict(best_model_factors, newx = x_test_factors, s = "lambda.min")
+mse_enet_factors <- mean((y_test - preds_enet_factors)^2)
+
+# 3. Random Forest Predictions (Factors)
+preds_rf_factors <- predict(rf_model_factors, data = test_data_factors)$predictions
+mse_rf_factors <- mean((y_test - preds_rf_factors)^2)
+
+# --- 12-C. Compare Final Performance (Factors) ---
+results_factors <- tibble(
+  Model = c("OLS (Factors)", "Elastic Net (Factors)", "Random Forest (Factors)"),
+  Test_MSE = c(mse_ols_factors, mse_enet_factors, mse_rf_factors)
+)
+
+print("--- ANALYSIS 3: FACTOR-ONLY PREDICTORS ---")
+print(results_factors)
