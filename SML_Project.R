@@ -161,7 +161,6 @@ y_test      <- test_data_proc$sp500_excess
 ### --- 10. Define Reusable Analysis Function --- ###
 #################################################
 
-# This function runs all 3 models for a given set of predictors
 run_analysis_pipeline <- function(predictor_names, analysis_label) {
   
   cat("\n--- Running Analysis for:", analysis_label, "---\n")
@@ -184,26 +183,49 @@ run_analysis_pipeline <- function(predictor_names, analysis_label) {
   # Model 1: OLS (Baseline)
   ols_model <- lm(sp500_excess ~ ., data = train_data_subset)
   
-  # Model 2: Tune Elastic Net
-  alphas_to_try <- c(0, 0.5, 1) # 0=Ridge, 1=Lasso
-  best_mse <- Inf
-  best_enet_model <- NULL
+  # Model 2: Tune Elastic Net (Ridge, Lasso, and ENET)
+  
+  # --- Finer grid for alpha ---
+  alphas_to_try <- seq(0, 1, by = 0.1) 
+  
+  model_list <- list()
+  validation_mse <- c()
+  
+  cat("Tuning Elastic Net (alpha grid):", alphas_to_try, "\n")
   
   for (a in alphas_to_try) {
+    # Fit cv.glmnet for each alpha
     cv_fit <- cv.glmnet(x_train_subset, y_train, alpha = a, family = "gaussian")
+    
+    # Get validation MSE for this alpha
     preds_val <- predict(cv_fit, newx = x_val_subset, s = "lambda.min")
     mse_val <- mean((y_val - preds_val)^2)
     
-    if (mse_val < best_mse) {
-      best_mse   <- mse_val
-      best_enet_model <- cv_fit
-    }
+    # Store the model and its validation MSE, named by alpha
+    model_list[[as.character(a)]] <- cv_fit
+    validation_mse[as.character(a)] <- mse_val
   }
   
-  cat("Best Tuned Alpha (", analysis_label, "):", best_enet_model$glmnet.fit$alpha, "\n")
-  cat("Best Tuned Lambda (", analysis_label, "):", best_enet_model$lambda.min, "\n")
-
-  # Model 3: Random Forest 
+  # --- Identify the specific models based on alpha ---
+  
+  # Model 2a: Ridge (alpha = 0)
+  ridge_model <- model_list[["0"]]
+  
+  # Model 2b: Lasso (alpha = 1)
+  lasso_model <- model_list[["1"]]
+  
+  # Model 2c: Best Tuned Elastic Net (alpha between 0 and 1)
+  # We exclude 0 and 1 from the search
+  enet_mses <- validation_mse[!names(validation_mse) %in% c("0", "1")]
+  
+  # Find the best alpha from this subset
+  best_alpha_str <- names(which.min(enet_mses))
+  best_alpha <- as.numeric(best_alpha_str)
+  best_enet_model <- model_list[[best_alpha_str]]
+  
+  print(paste("Best Tuned Elastic Net Alpha (", analysis_label, "):", best_alpha))
+  
+  # Model 3: Random Forest
   set.seed(123) # for reproducibility
   rf_model <- randomForest(
     formula   = sp500_excess ~ ., 
@@ -218,7 +240,15 @@ run_analysis_pipeline <- function(predictor_names, analysis_label) {
   preds_ols <- predict(ols_model, newdata = test_data_subset)
   mse_ols <- mean((y_test - preds_ols)^2)
   
-  # Elastic Net MSE
+  # Ridge MSE
+  preds_ridge <- predict(ridge_model, newx = x_test_subset, s = "lambda.min")
+  mse_ridge <- mean((y_test - preds_ridge)^2)
+  
+  # Lasso MSE
+  preds_lasso <- predict(lasso_model, newx = x_test_subset, s = "lambda.min")
+  mse_lasso <- mean((y_test - preds_lasso)^2)
+  
+  # Best Elastic Net MSE
   preds_enet <- predict(best_enet_model, newx = x_test_subset, s = "lambda.min")
   mse_enet <- mean((y_test - preds_enet)^2)
   
@@ -229,8 +259,14 @@ run_analysis_pipeline <- function(predictor_names, analysis_label) {
   # --- 4. Return Results ---
   results <- tibble(
     Analysis = analysis_label,
-    Model = c("OLS", "Elastic Net (Tuned)", "Random Forest"),
-    Test_MSE = c(mse_ols, mse_enet, mse_rf)
+    Model = c(
+      "OLS", 
+      "Ridge (alpha=0)", 
+      "Lasso (alpha=1)", 
+      paste0("Elastic Net (a=", best_alpha, ")"), # Add best alpha to name
+      "Random Forest"
+    ),
+    Test_MSE = c(mse_ols, mse_ridge, mse_lasso, mse_enet, mse_rf)
   )
   
   return(results)
