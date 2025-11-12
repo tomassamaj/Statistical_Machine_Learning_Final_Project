@@ -200,7 +200,6 @@ run_analysis_pipeline <- function(predictor_names, analysis_label) {
     validation_mse[as.character(a)] <- mse_val
   }
   
-  # Identify specific models
   ridge_model <- model_list[["0"]]
   lasso_model <- model_list[["1"]]
   
@@ -211,7 +210,7 @@ run_analysis_pipeline <- function(predictor_names, analysis_label) {
   
   print(paste("Best Tuned Elastic Net Alpha (", analysis_label, "):", best_alpha))
   
-  # Model 3: Random Forest (No tuning, using defaults)
+  # Model 3: Random Forest
   set.seed(123)
   rf_model <- randomForest(
     formula   = sp500_excess ~ ., 
@@ -220,97 +219,63 @@ run_analysis_pipeline <- function(predictor_names, analysis_label) {
     mtry      = floor(ncol(x_train_subset) / 3) 
   )
   
-  # <-- ADDED: Model 4: Gradient Boosting (GBM) -->
-  # This is the third method from the course slides [cite: 41, 435]
+  # Model 4: Gradient Boosting (GBM)
   cat("Tuning Gradient Boosting...\n")
-  
-  # Hyperparameter grid for GBM
   param_grid_gbm <- expand.grid(
-    shrinkage = c(0.01, 0.1),         # Learning rate [cite: 408]
-    interaction.depth = c(1, 2, 3),  # Tree complexity [cite: 392, 394]
-    n.trees = c(100, 200, 300)       # Number of iterations (M) [cite: 403]
+    shrinkage = c(0.01, 0.1),
+    interaction.depth = c(1, 2, 3),
+    n.trees = c(100, 200, 300)
   )
-  
   best_gbm_mse <- Inf
   best_gbm_params <- NULL
   
   for (i in 1:nrow(param_grid_gbm)) {
     params <- param_grid_gbm[i, ]
-    
     set.seed(123)
     gbm_fit <- gbm(
-      sp500_excess ~ .,
-      data = train_data_subset,
-      distribution = "gaussian", # For regression
-      n.trees = params$n.trees,
-      interaction.depth = params$interaction.depth,
-      shrinkage = params$shrinkage,
-      n.minobsinnode = 10, 
-      verbose = FALSE
+      sp500_excess ~ ., data = train_data_subset, distribution = "gaussian",
+      n.trees = params$n.trees, interaction.depth = params$interaction.depth,
+      shrinkage = params$shrinkage, n.minobsinnode = 10, verbose = FALSE
     )
-    
-    # Predict on VALIDATION data
-    preds_val_gbm <- predict(gbm_fit, 
-                             newdata = val_data_subset, 
-                             n.trees = params$n.trees)
-    
+    preds_val_gbm <- predict(gbm_fit, newdata = val_data_subset, n.trees = params$n.trees)
     mse_val_gbm <- mean((y_val - preds_val_gbm)^2)
-    
     if (mse_val_gbm < best_gbm_mse) {
       best_gbm_mse <- mse_val_gbm
       best_gbm_params <- params
     }
   }
-  
   print(paste("Best GBM interaction.depth:", best_gbm_params$interaction.depth))
   print(paste("Best GBM shrinkage:", best_gbm_params$shrinkage))
   print(paste("Best GBM n.trees:", best_gbm_params$n.trees))
   
-  # Fit final GBM on training data with best params
   set.seed(123)
   final_gbm_model <- gbm(
-    sp500_excess ~ .,
-    data = train_data_subset,
-    distribution = "gaussian",
-    n.trees = best_gbm_params$n.trees,
-    interaction.depth = best_gbm_params$interaction.depth,
-    shrinkage = best_gbm_params$shrinkage,
-    n.minobsinnode = 10,
-    verbose = FALSE
+    sp500_excess ~ ., data = train_data_subset, distribution = "gaussian",
+    n.trees = best_gbm_params$n.trees, interaction.depth = best_gbm_params$interaction.depth,
+    shrinkage = best_gbm_params$shrinkage, n.minobsinnode = 10, verbose = FALSE
   )
   
   # --- 3. Assess Models on TEST Data ---
   
-  # OLS MSE
+  # Get all predictions
   preds_ols <- predict(ols_model, newdata = test_data_subset)
-  mse_ols <- mean((y_test - preds_ols)^2)
-  
-  # Ridge MSE
   preds_ridge <- predict(ridge_model, newx = x_test_subset, s = "lambda.min")
-  mse_ridge <- mean((y_test - preds_ridge)^2)
-  
-  # Lasso MSE
   preds_lasso <- predict(lasso_model, newx = x_test_subset, s = "lambda.min")
-  mse_lasso <- mean((y_test - preds_lasso)^2)
-  
-  # Best Elastic Net MSE
   preds_enet <- predict(best_enet_model, newx = x_test_subset, s = "lambda.min")
-  mse_enet <- mean((y_test - preds_enet)^2)
-  
-  # Random Forest MSE
   preds_rf <- predict(rf_model, newdata = test_data_subset)
-  mse_rf <- mean((y_test - preds_rf)^2)
+  preds_gbm <- predict(final_gbm_model, newdata = test_data_subset, n.trees = best_gbm_params$n.trees)
   
-  # <-- ADDED: GBM MSE -->
-  preds_gbm <- predict(final_gbm_model, 
-                       newdata = test_data_subset, 
-                       n.trees = best_gbm_params$n.trees)
+  # Calculate MSEs
+  mse_ols <- mean((y_test - preds_ols)^2)
+  mse_ridge <- mean((y_test - as.vector(preds_ridge))^2)
+  mse_lasso <- mean((y_test - as.vector(preds_lasso))^2)
+  mse_enet <- mean((y_test - as.vector(preds_enet))^2)
+  mse_rf <- mean((y_test - preds_rf)^2)
   mse_gbm <- mean((y_test - preds_gbm)^2)
   
   # --- 4. Return Results ---
   results <- tibble(
     Analysis = analysis_label,
-    # <-- MODIFIED: Added GBM -->
     Model = c(
       "OLS", 
       "Ridge (alpha=0)", 
@@ -322,7 +287,20 @@ run_analysis_pipeline <- function(predictor_names, analysis_label) {
     Test_MSE = c(mse_ols, mse_ridge, mse_lasso, mse_enet, mse_rf, mse_gbm)
   )
   
-  return(results)
+  # <-- MODIFIED: Create a tibble of predictions -->
+  predictions_tbl <- tibble(
+    date = test_data_proc$date, # Get dates from test set
+    Actual = y_test,
+    OLS = as.vector(preds_ols),
+    Ridge = as.vector(preds_ridge),
+    Lasso = as.vector(preds_lasso),
+    Elastic_Net = as.vector(preds_enet),
+    Random_Forest = as.vector(preds_rf),
+    Gradient_Boosting = as.vector(preds_gbm)
+  )
+  
+  # <-- MODIFIED: Return both results and predictions -->
+  return(list(results = results, predictions = predictions_tbl))
 }
 
 
@@ -330,37 +308,136 @@ run_analysis_pipeline <- function(predictor_names, analysis_label) {
 ### --- 11. Run All Analyses & Compare --- ###
 #################################################
 
+# <-- MODIFIED: Store the full list output from each run -->
+
 # Analysis 1: FF5 Only
-results_ff5 <- run_analysis_pipeline(
+analysis_output_ff5 <- run_analysis_pipeline(
   predictor_names = ff5_predictors_lagged,
   analysis_label = "FF5 Only"
 )
 
 # Analysis 2: Themes Only
-results_themes <- run_analysis_pipeline(
+analysis_output_themes <- run_analysis_pipeline(
   predictor_names = theme_predictors_lagged,
   analysis_label = "Themes Only"
 )
 
 # Analysis 3: Factors Only
-results_factors <- run_analysis_pipeline(
+analysis_output_factors <- run_analysis_pipeline(
   predictor_names = factor_predictors_lagged,
   analysis_label = "Factors Only"
 )
 
 # Analysis 4: All Predictors
-results_all <- run_analysis_pipeline(
+analysis_output_all <- run_analysis_pipeline(
   predictor_names = all_predictors_lagged,
   analysis_label = "All Predictors"
 )
 
 # --- 12. Consolidate and Print Final Results ---
 
+# <-- MODIFIED: Extract the $results component from each output -->
 final_results_table <- bind_rows(
-  results_ff5,
-  results_themes,
-  results_factors,
-  results_all
+  analysis_output_ff5$results,
+  analysis_output_themes$results,
+  analysis_output_factors$results,
+  analysis_output_all$results
 )
 
 print(final_results_table, n = Inf)
+
+
+#################################################
+### --- 13. Plot Test Set Predictions --- ###
+#################################################
+
+# --- Define a reusable plotting function ---
+# This avoids repeating the same ggplot code four times
+
+plot_cumulative_returns <- function(predictions_tbl, analysis_title) {
+  
+  # --- 1. Calculate Cumulative Returns ---
+  cumulative_returns_tbl <- predictions_tbl %>%
+    # Convert all excess returns to gross returns (1 + r)
+    mutate(across(-date, ~ 1 + .)) %>%
+    # Calculate the cumulative product for all columns
+    mutate(across(-date, cumprod))
+
+  # --- 2. Convert to Long Format for ggplot ---
+  cumulative_returns_long <- cumulative_returns_tbl %>%
+    pivot_longer(
+      cols = -date,
+      names_to = "Model",
+      values_to = "Cumulative_Return"
+    )
+
+  # --- 3. Create the Plot ---
+  # We use print() to ensure the plot displays when called from the script
+  print(
+    ggplot(cumulative_returns_long, aes(x = date, y = Cumulative_Return, color = Model)) +
+      
+      # Plot all the model prediction lines
+      geom_line(data = . %>% filter(Model != "Actual"), alpha = 0.8) +
+      
+      # Add the "Actual" line on top, in black and slightly thicker
+      geom_line(
+        data = . %>% filter(Model == "Actual"), 
+        color = "black", 
+        linewidth = 0.75
+      ) +
+      
+      labs(
+        title = "Cumulative Returns of Model Predictions vs. Actual (Test Set)",
+        subtitle = paste("Analysis:", analysis_title), # Use the function argument
+        x = "Date",
+        y = "Cumulative Return (1 + r)",
+        color = "Legend"
+      ) +
+      
+      # Add a horizontal line at 1.0 (breakeven)
+      geom_hline(yintercept = 1.0, linetype = "dashed", color = "grey50") +
+      
+      # Use a log scale for the y-axis
+      scale_y_log10() + 
+      
+      scale_color_manual(
+        values = c(
+          "Actual" = "black", 
+          "OLS" = "deepskyblue3", 
+          "Ridge" = "darkorange", 
+          "Lasso" = "firebrick",
+          "Elastic_Net" = "red", 
+          "Random_Forest" = "forestgreen", 
+          "Gradient_Boosting" = "darkviolet"
+        )
+      ) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+  )
+}
+
+# --- Now, call the function for each of your four analyses ---
+
+# Plot 1: FF5 Only
+plot_cumulative_returns(
+  predictions_tbl = analysis_output_ff5$predictions,
+  analysis_title = "FF5 Predictors Only"
+)
+
+# Plot 2: Themes Only
+plot_cumulative_returns(
+  predictions_tbl = analysis_output_themes$predictions,
+  analysis_title = "Theme Predictors Only"
+)
+
+# Plot 3: Factors Only
+plot_cumulative_returns(
+  predictions_tbl = analysis_output_factors$predictions,
+  analysis_title = "Factor Predictors Only"
+)
+
+# Plot 4: All Predictors
+plot_cumulative_returns(
+  predictions_tbl = analysis_output_all$predictions,
+  analysis_title = "All Predictors"
+)
