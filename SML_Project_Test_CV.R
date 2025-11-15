@@ -12,7 +12,7 @@ all_packages <- c(
   "randomForest",
   "gbm",
   "nnet",
-  "tibble" # <-- ADDED: For rownames_to_column
+  "tibble" # For rownames_to_column
 )
 
 options(repos = "https://cloud.r-project.org")
@@ -126,48 +126,54 @@ theme_predictors_lagged <- paste0(theme_names, "_lag1")
 factor_names <- all_factors_wide %>% select(-date) %>% colnames()
 factor_predictors_lagged <- paste0(factor_names, "_lag1")
 
-# <-- MODIFIED: This is your new "All Predictors" set -->
 # Set 4: All Predictors (FF5 + Themes + Factors)
-# We use unique() to avoid duplicating any columns that might be in multiple sets
 all_predictors_lagged <- unique(c(ff5_predictors_lagged, theme_predictors_lagged, factor_predictors_lagged))
 
 
 #################################################
-### --- 8. Create Time-Series Splits (Train/Val/Test) --- ###
+### --- 8. Create Time-Series Splits (Train/Test) --- ###
 #################################################
 
+# <-- MODIFIED: Switched to 70/30 Train/Test split -->
 n <- nrow(final_data)
-train_end <- floor(0.50 * n)
-val_end <- floor(0.75 * n)
+train_end <- floor(0.70 * n)
 
 train_data <- final_data |> slice(1:train_end)
-val_data   <- final_data |> slice((train_end + 1):val_end)
-test_data  <- final_data |> slice((val_end + 1):n)
+test_data  <- final_data |> slice((train_end + 1):n)
 
 # --- 9. Pre-processing: Standardize the Data ---
-# nnet is also sensitive to scaling, so we use the standardized data
 preproc_params <- preProcess(train_data[, -c(1, 2)], 
                              method = c("center", "scale"))
 
 train_data_proc <- predict(preproc_params, train_data)
-val_data_proc   <- predict(preproc_params, val_data)
 test_data_proc  <- predict(preproc_params, test_data)
 
-# Create full X/Y matrices
+# Create full X/Y matrices and vectors for all models
 x_train_full <- as.matrix(train_data_proc[, -c(1, 2)])
 y_train      <- train_data_proc$sp500_excess
 
-x_val_full <- as.matrix(val_data_proc[, -c(1, 2)])
-y_val      <- val_data_proc$sp500_excess
-
 x_test_full <- as.matrix(test_data_proc[, -c(1, 2)])
 y_test      <- test_data_proc$sp500_excess
+
+# <-- ADDED: Define Time-Series CV Folds -->
+# We create the folds on the *training set* for hyperparameter tuning
+window_length <- 60  # 5 years
+horizon       <- 24  # 2 years
+set.seed(123)
+cv_folds <- createTimeSlices(
+  1:nrow(train_data_proc), # Use the 70% training set
+  initialWindow = window_length,
+  horizon       = horizon,
+  fixedWindow   = TRUE # Rolling window
+)
+
 
 #################################################
 ### --- 10. Define Reusable Analysis Function --- ###
 #################################################
 
-run_analysis_pipeline <- function(predictor_names, analysis_label) {
+# <-- MODIFIED: This function now uses TS-CV for tuning -->
+run_analysis_pipeline <- function(predictor_names, analysis_label, cv_folds) {
   
   cat("\n--- Running Analysis for:", analysis_label, "---\n")
   
@@ -176,68 +182,88 @@ run_analysis_pipeline <- function(predictor_names, analysis_label) {
   # Data for lm(), randomForest(), gbm(), nnet()
   train_data_subset <- train_data_proc %>% 
     select(sp500_excess, all_of(predictor_names))
-  val_data_subset <- val_data_proc %>% 
-    select(sp500_excess, all_of(predictor_names))
   test_data_subset <- test_data_proc %>% 
     select(sp500_excess, all_of(predictor_names))
   
   # Matrices for glmnet()
   x_train_subset <- x_train_full[, predictor_names, drop = FALSE]
-  x_val_subset   <- x_val_full[, predictor_names, drop = FALSE]
   x_test_subset  <- x_test_full[, predictor_names, drop = FALSE]
   
   # --- 2. Fit Models ---
   
-  # Model 1: Tune Elastic Net (Ridge, Lasso, and ENET)
+  # --- Model 1: Tune Elastic Net ---
   alphas_to_try <- seq(0, 1, by = 0.1) 
-  model_list <- list()
-  validation_mse <- c()
+  best_mean_mse <- Inf
+  best_alpha <- NA
+  best_lambda <- NA
   
   cat("Tuning Elastic Net (alpha grid):", alphas_to_try, "\n")
   
   for (a in alphas_to_try) {
-    cv_fit <- cv.glmnet(x_train_subset, y_train, alpha = a, family = "gaussian")
-    preds_val <- predict(cv_fit, newx = x_val_subset, s = "lambda.min")
-    mse_val <- mean((y_val - preds_val)^2)
-    model_list[[as.character(a)]] <- cv_fit
-    validation_mse[as.character(a)] <- mse_val
+    fold_mses <- c()
+    fold_lambdas <- c()
+    
+    for (i in seq_along(cv_folds$train)) {
+      train_idx <- cv_folds$train[[i]]
+      val_idx   <- cv_folds$test[[i]]
+      
+      cv_fit <- cv.glmnet(x_train_subset[train_idx, ], y_train[train_idx], 
+                          alpha = a, family = "gaussian")
+      
+      fold_lambdas <- c(fold_lambdas, cv_fit$lambda.1se)
+      
+      preds_val <- predict(cv_fit, newx = x_train_subset[val_idx, ], s = "lambda.1se")
+      fold_mses <- c(fold_mses, mean((y_train[val_idx] - preds_val)^2))
+    }
+    
+    mean_fold_mse <- mean(fold_mses, na.rm = TRUE)
+    
+    if (mean_fold_mse < best_mean_mse) {
+      best_mean_mse <- mean_fold_mse
+      best_alpha <- a
+      best_lambda <- median(fold_lambdas, na.rm = TRUE)
+    }
   }
   
-  ridge_model <- model_list[["0"]]
-  lasso_model <- model_list[["1"]]
-  
-  enet_mses <- validation_mse[!names(validation_mse) %in% c("0", "1")]
-  best_alpha_str <- names(which.min(enet_mses))
-  best_alpha <- as.numeric(best_alpha_str)
-  best_enet_model <- model_list[[best_alpha_str]]
-  
   print(paste("Best Tuned Elastic Net Alpha (", analysis_label, "):", best_alpha))
+  print(paste("Best Tuned Elastic Net Lambda (", analysis_label, "):", best_lambda))
   
-  # Model 2: Tune Random Forest
+  # Fit final ENET models on *full training set*
+  ridge_model <- glmnet(x_train_subset, y_train, alpha = 0, family = "gaussian", lambda = best_lambda)
+  lasso_model <- glmnet(x_train_subset, y_train, alpha = 1, family = "gaussian", lambda = best_lambda)
+  best_enet_model <- glmnet(x_train_subset, y_train, alpha = best_alpha, family = "gaussian", lambda = best_lambda)
+  
+  # --- Model 2: Tune Random Forest ---
   cat("Tuning Random Forest (mtry)...\n")
   
   p_subset <- ncol(x_train_subset)
-  # Create a reasonable grid of mtry values to test
   mtry_grid <- unique(floor(pmax(1, c(sqrt(p_subset), p_subset/3, p_subset/2))))
   
-  best_rf_mse <- Inf
+  best_mean_mse_rf <- Inf
   best_mtry <- NA
   
   for (m in mtry_grid) {
-    set.seed(123)
-    rf_fit <- randomForest(
-      formula   = sp500_excess ~ ., 
-      data      = train_data_subset,
-      num.trees = 500,
-      mtry      = m 
-    )
+    fold_mses_rf <- c()
+    for (i in seq_along(cv_folds$train)) {
+      train_idx <- cv_folds$train[[i]]
+      val_idx   <- cv_folds$test[[i]]
+      
+      set.seed(123)
+      rf_fit <- randomForest(
+        x = x_train_subset[train_idx, ],
+        y = y_train[train_idx],
+        num.trees = 500,
+        mtry      = m 
+      )
+      
+      preds_val_rf <- predict(rf_fit, newdata = x_train_subset[val_idx, ])
+      fold_mses_rf <- c(fold_mses_rf, mean((y_train[val_idx] - preds_val_rf)^2))
+    }
     
-    # Predict on VALIDATION data
-    preds_val_rf <- predict(rf_fit, newdata = val_data_subset)
-    mse_val_rf <- mean((y_val - preds_val_rf)^2)
+    mean_fold_mse_rf <- mean(fold_mses_rf, na.rm = TRUE)
     
-    if (mse_val_rf < best_rf_mse) {
-      best_rf_mse <- mse_val_rf
+    if (mean_fold_mse_rf < best_mean_mse_rf) {
+      best_mean_mse_rf <- mean_fold_mse_rf
       best_mtry <- m
     }
   }
@@ -247,81 +273,108 @@ run_analysis_pipeline <- function(predictor_names, analysis_label) {
   # Fit final RF on training data with best mtry
   set.seed(123)
   final_rf_model <- randomForest(
-    formula   = sp500_excess ~ ., 
-    data      = train_data_subset,
+    x = x_train_subset,
+    y = y_train,
     num.trees = 500,
     mtry      = best_mtry,
-    importance = TRUE # Need this for variable importance
+    importance = TRUE 
   )
   
-  # Model 3: Gradient Boosting (GBM)
+  # --- Model 3: Tune Gradient Boosting (GBM) ---
   cat("Tuning Gradient Boosting...\n")
   param_grid_gbm <- expand.grid(
     shrinkage = c(0.01, 0.1),
     interaction.depth = c(1, 2, 3),
     n.trees = c(100, 200, 300)
   )
-  best_gbm_mse <- Inf
+  best_mean_mse_gbm <- Inf
   best_gbm_params <- NULL
   
   for (i in 1:nrow(param_grid_gbm)) {
     params <- param_grid_gbm[i, ]
-    set.seed(123)
-    gbm_fit <- gbm(
-      sp500_excess ~ ., data = train_data_subset, distribution = "gaussian",
-      n.trees = params$n.trees, interaction.depth = params$interaction.depth,
-      shrinkage = params$shrinkage, n.minobsinnode = 10, verbose = FALSE
-    )
-    preds_val_gbm <- predict(gbm_fit, newdata = val_data_subset, n.trees = params$n.trees)
-    mse_val_gbm <- mean((y_val - preds_val_gbm)^2)
-    if (mse_val_gbm < best_gbm_mse) {
-      best_gbm_mse <- mse_val_gbm
+    fold_mses_gbm <- c()
+    
+    for (j in seq_along(cv_folds$train)) {
+      train_idx <- cv_folds$train[[j]]
+      val_idx   <- cv_folds$test[[j]]
+      
+      set.seed(123)
+      gbm_fit <- gbm(
+        sp500_excess ~ ., 
+        data = train_data_subset[train_idx, ], 
+        distribution = "gaussian",
+        n.trees = params$n.trees, 
+        interaction.depth = params$interaction.depth,
+        shrinkage = params$shrinkage, 
+        n.minobsinnode = 10, 
+        verbose = FALSE
+      )
+      preds_val_gbm <- predict(gbm_fit, newdata = train_data_subset[val_idx, ], 
+                               n.trees = params$n.trees)
+      fold_mses_gbm <- c(fold_mses_gbm, mean((y_train[val_idx] - preds_val_gbm)^2))
+    }
+    
+    mean_fold_mse_gbm <- mean(fold_mses_gbm, na.rm = TRUE)
+    
+    if (mean_fold_mse_gbm < best_mean_mse_gbm) {
+      best_mean_mse_gbm <- mean_fold_mse_gbm
       best_gbm_params <- params
     }
   }
+  
   print(paste("Best GBM interaction.depth:", best_gbm_params$interaction.depth))
   print(paste("Best GBM shrinkage:", best_gbm_params$shrinkage))
   print(paste("Best GBM n.trees:", best_gbm_params$n.trees))
   
+  # Fit final GBM on training data with best params
   set.seed(123)
   final_gbm_model <- gbm(
     sp500_excess ~ ., data = train_data_subset, distribution = "gaussian",
-    n.trees = best_gbm_params$n.trees, interaction.depth = best_gbm_params$interaction.depth,
-    shrinkage = best_gbm_params$shrinkage, n.minobsinnode = 10, verbose = FALSE
+    n.trees = best_gbm_params$n.trees, 
+    interaction.depth = best_gbm_params$interaction.depth,
+    shrinkage = best_gbm_params$shrinkage, 
+    n.minobsinnode = 10, 
+    verbose = FALSE
   )
   
-  # Model 4: Tune Neural Network (size and decay)
+  # --- Model 4: Tune Neural Network (nnet) ---
   cat("Tuning Neural Network (nnet)...\n")
   
-  # Hyperparameter grid for nnet
-  size_grid <- c(3, 5, 10) # Number of hidden units
-  lambdas_to_try <- seq(0, 0.1, by = 0.01) # decay parameter
+  size_grid <- c(3, 5, 10) 
+  lambdas_to_try <- seq(0, 0.1, by = 0.01) 
   
-  best_nn_mse <- Inf
+  best_mean_mse_nn <- Inf
   best_lambda_nn <- NA
   best_size_nn <- NA
   
-  # Nested loop for size and decay
   for (s in size_grid) {
     for (lam in lambdas_to_try) {
-      set.seed(123)
-      nn_fit <- nnet::nnet(
-        sp500_excess ~ .,
-        data = train_data_subset,
-        size = s,
-        linout = TRUE, 
-        decay = lam,   
-        maxit = 1000,
-        trace = FALSE,
-        MaxNWts = 5000  # Increase weight limit
-      )
+      fold_mses_nn <- c()
       
-      # Predict on VALIDATION data
-      preds_val_nn <- predict(nn_fit, newdata = val_data_subset)
-      mse_val_nn <- mean((y_val - preds_val_nn)^2)
+      for (k in seq_along(cv_folds$train)) {
+        train_idx <- cv_folds$train[[k]]
+        val_idx   <- cv_folds$test[[k]]
+        
+        set.seed(123)
+        nn_fit <- nnet::nnet(
+          sp500_excess ~ .,
+          data = train_data_subset[train_idx, ],
+          size = s,
+          linout = TRUE, 
+          decay = lam,   
+          maxit = 1000,
+          trace = FALSE,
+          MaxNWts = 5000 
+        )
+        
+        preds_val_nn <- predict(nn_fit, newdata = train_data_subset[val_idx, ])
+        fold_mses_nn <- c(fold_mses_nn, mean((y_train[val_idx] - preds_val_nn)^2))
+      }
       
-      if (mse_val_nn < best_nn_mse) {
-        best_nn_mse <- mse_val_nn
+      mean_fold_mse_nn <- mean(fold_mses_nn, na.rm = TRUE)
+      
+      if (mean_fold_mse_nn < best_mean_mse_nn) {
+        best_mean_mse_nn <- mean_fold_mse_nn
         best_lambda_nn <- lam
         best_size_nn <- s
       }
@@ -341,15 +394,15 @@ run_analysis_pipeline <- function(predictor_names, analysis_label) {
     decay = best_lambda_nn,
     maxit = 1000,
     trace = FALSE,
-    MaxNWts = 5000  # Increase weight limit
+    MaxNWts = 5000
   )
   
   # --- 3. Assess Models on TEST Data ---
   
   # Get all predictions
-  preds_ridge <- predict(ridge_model, newx = x_test_subset, s = "lambda.min")
-  preds_lasso <- predict(lasso_model, newx = x_test_subset, s = "lambda.min")
-  preds_enet <- predict(best_enet_model, newx = x_test_subset, s = "lambda.min")
+  preds_ridge <- predict(ridge_model, newx = x_test_subset)
+  preds_lasso <- predict(lasso_model, newx = x_test_subset)
+  preds_enet <- predict(best_enet_model, newx = x_test_subset)
   preds_rf <- predict(final_rf_model, newdata = test_data_subset) 
   preds_gbm <- predict(final_gbm_model, newdata = test_data_subset, n.trees = best_gbm_params$n.trees)
   preds_nn <- predict(final_nn_model, newdata = test_data_subset) 
@@ -422,35 +475,41 @@ run_analysis_pipeline <- function(predictor_names, analysis_label) {
 ### --- 11. Run All Analyses & Compare --- ###
 #################################################
 
+# <-- MODIFIED: Pass the cv_folds to the function -->
+
 # Analysis 1: FF5 Only
 analysis_output_ff5 <- run_analysis_pipeline(
   predictor_names = ff5_predictors_lagged,
-  analysis_label = "FF5 Only"
+  analysis_label = "FF5 Only",
+  cv_folds = cv_folds
 )
 
 # Analysis 1b: FF3 Only
 analysis_output_ff3 <- run_analysis_pipeline(
   predictor_names = ff3_predictors_lagged,
-  analysis_label = "FF3 Only"
+  analysis_label = "FF3 Only",
+  cv_folds = cv_folds
 )
 
 # Analysis 2: Themes Only
 analysis_output_themes <- run_analysis_pipeline(
   predictor_names = theme_predictors_lagged,
-  analysis_label = "Themes Only"
+  analysis_label = "Themes Only",
+  cv_folds = cv_folds
 )
 
 # Analysis 3: Factors Only
 analysis_output_factors <- run_analysis_pipeline(
   predictor_names = factor_predictors_lagged,
-  analysis_label = "Factors Only"
+  analysis_label = "Factors Only",
+  cv_folds = cv_folds
 )
 
-# <-- MODIFIED: This now runs the "All Predictors" analysis -->
 # Analysis 4: All Predictors
 analysis_output_all <- run_analysis_pipeline(
   predictor_names = all_predictors_lagged,
-  analysis_label = "All Predictors"
+  analysis_label = "All Predictors",
+  cv_folds = cv_folds
 )
 
 # --- 12. Consolidate and Print Final Results ---
@@ -460,7 +519,7 @@ final_results_table <- bind_rows(
   analysis_output_ff3$results, 
   analysis_output_themes$results,
   analysis_output_factors$results,
-  analysis_output_all$results # <-- MODIFIED
+  analysis_output_all$results
 )
 
 # The final table will now include tuned model names, Test_RMSE_pct and Test_MAE_pct
@@ -521,17 +580,18 @@ plot_predicted_returns <- function(predictions_tbl, analysis_title) {
 }
 
 # --- Call the function for each analysis ---
+# (This section is unchanged)
 
 # Plot 1: FF5 Only
 plot_predicted_returns(
   predictions_tbl = analysis_output_ff5$predictions,
-  analysis_title = "FF5 Predictors Only"
+  analysis_label = "FF5 Predictors Only"
 )
 
 # Plot 2: FF3 Only
 plot_predicted_returns(
   predictions_tbl = analysis_output_ff3$predictions,
-  analysis_title = "FF3 Predictors Only"
+  analysis_label = "FF3 Predictors Only"
 )
 
 # Plot 3: Themes Only
@@ -546,11 +606,10 @@ plot_predicted_returns(
   analysis_title = "Factor Predictors Only"
 )
 
-# <-- MODIFIED: This now plots the "All Predictors" results -->
 # Plot 5: All Predictors
 plot_predicted_returns(
   predictions_tbl = analysis_output_all$predictions,
-  analysis_title = "All Predictors"
+  analysis_label = "All Predictors"
 )
 
 
@@ -559,6 +618,7 @@ plot_predicted_returns(
 #################################################
 
 # --- Define a reusable plotting function ---
+# (This function is unchanged)
 plot_cumulative_returns <- function(predictions_tbl, analysis_title) {
   
   # --- 1. Calculate Cumulative Returns ---
@@ -615,6 +675,7 @@ plot_cumulative_returns <- function(predictions_tbl, analysis_title) {
 }
 
 # --- Call the function for each of your analyses ---
+# (This section is unchanged)
 
 # Plot 1: FF5 Only
 plot_cumulative_returns(
@@ -640,7 +701,6 @@ plot_cumulative_returns(
   analysis_title = "Factor Predictors Only"
 )
 
-# <-- MODIFIED: This now plots the "All Predictors" results -->
 # Plot 5: All Predictors
 plot_cumulative_returns(
   predictions_tbl = analysis_output_all$predictions,
@@ -674,8 +734,8 @@ plot_variable_importance <- function(importance_df, model_title) {
   )
 }
 
-# <-- MODIFIED: This now plots importance for the "All Predictors" analysis -->
 # --- Plot importance for the "All Predictors" analysis ---
+# This is likely your most interesting model set
 
 # Random Forest Importance
 plot_variable_importance(
