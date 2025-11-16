@@ -12,7 +12,7 @@ all_packages <- c(
   "randomForest",
   "gbm",
   "nnet",
-  "tibble" # <-- ADDED: For rownames_to_column
+  "tibble"
 )
 
 options(repos = "https://cloud.r-project.org")
@@ -108,9 +108,9 @@ final_data <- master_tbl |>
   slice(-1) |>
   drop_na() # Clean up any remaining NAs
 
-###########################################################
+#####################################################
 ### --- 7. Define Predictor Sets for Analysis --- ###
-###########################################################
+#####################################################
 
 # Set 1: FF5 Only
 ff5_predictors_lagged <- c("mkt_excess_lag1", "smb_lag1", "hml_lag1", "rmw_lag1", "cma_lag1")
@@ -132,9 +132,9 @@ factor_predictors_lagged <- paste0(factor_names, "_lag1")
 all_predictors_lagged <- unique(c(ff5_predictors_lagged, theme_predictors_lagged, factor_predictors_lagged))
 
 
-#################################################
+#############################################################
 ### --- 8. Create Time-Series Splits (Train/Val/Test) --- ###
-#################################################
+#############################################################
 
 n <- nrow(final_data)
 train_end <- floor(0.50 * n)
@@ -163,9 +163,9 @@ y_val      <- val_data_proc$sp500_excess
 x_test_full <- as.matrix(test_data_proc[, -c(1, 2)])
 y_test      <- test_data_proc$sp500_excess
 
-#################################################
+#####################################################
 ### --- 10. Define Reusable Analysis Function --- ###
-#################################################
+#####################################################
 
 run_analysis_pipeline <- function(predictor_names, analysis_label) {
   
@@ -213,6 +213,12 @@ run_analysis_pipeline <- function(predictor_names, analysis_label) {
   
   print(paste("Best Tuned Elastic Net Alpha (", analysis_label, "):", best_alpha))
   
+  # <-- ADDED: Create a tibble of ENET tuning results -->
+  enet_tuning_results <- tibble(
+    alpha = alphas_to_try,
+    Validation_MSE = validation_mse
+  )
+  
   # Model 2: Tune Random Forest
   cat("Tuning Random Forest (mtry)...\n")
   
@@ -222,6 +228,8 @@ run_analysis_pipeline <- function(predictor_names, analysis_label) {
   
   best_rf_mse <- Inf
   best_mtry <- NA
+  
+  rf_tuning_results <- tibble(mtry = numeric(), Validation_MSE = numeric())
   
   for (m in mtry_grid) {
     set.seed(123)
@@ -235,6 +243,8 @@ run_analysis_pipeline <- function(predictor_names, analysis_label) {
     # Predict on VALIDATION data
     preds_val_rf <- predict(rf_fit, newdata = val_data_subset)
     mse_val_rf <- mean((y_val - preds_val_rf)^2)
+    
+    rf_tuning_results <- bind_rows(rf_tuning_results, tibble(mtry = m, Validation_MSE = mse_val_rf))
     
     if (mse_val_rf < best_rf_mse) {
       best_rf_mse <- mse_val_rf
@@ -408,19 +418,21 @@ run_analysis_pipeline <- function(predictor_names, analysis_label) {
     Neural_Network = as.vector(preds_nn) 
   )
   
-  # Return all results
+  # <-- MODIFIED: Return all results, including tuning data -->
   return(list(
     results = results, 
     predictions = predictions_tbl,
     importance_rf = imp_rf_df,
-    importance_gbm = imp_gbm_df
+    importance_gbm = imp_gbm_df,
+    enet_tuning = enet_tuning_results,
+    rf_tuning = rf_tuning_results # <-- ADDED
   ))
 }
 
 
-#################################################
+##############################################
 ### --- 11. Run All Analyses & Compare --- ###
-#################################################
+##############################################
 
 # Analysis 1: FF5 Only
 analysis_output_ff5 <- run_analysis_pipeline(
@@ -467,9 +479,9 @@ final_results_table <- bind_rows(
 print(final_results_table, n = Inf)
 
 
-#######################################################
+##############################################################
 ### --- 13. Plot Test Set Predicted vs. Actual Returns --- ###
-#######################################################
+##############################################################
 
 # --- Define a reusable plotting function for raw returns ---
 plot_predicted_returns <- function(predictions_tbl, analysis_title) {
@@ -554,9 +566,9 @@ plot_predicted_returns(
 )
 
 
-#################################################
+####################################################
 ### --- 14. Plot Test Set Cumulative Returns --- ###
-#################################################
+####################################################
 
 # --- Define a reusable plotting function ---
 plot_cumulative_returns <- function(predictions_tbl, analysis_title) {
@@ -590,7 +602,7 @@ plot_cumulative_returns <- function(predictions_tbl, analysis_title) {
         title = "Cumulative Returns of Model Predictions vs. Actual (Test Set)",
         subtitle = paste("Analysis:", analysis_title), 
         x = "Date",
-        y = "Cumulative Return (1 + r)",
+        y = "Cumulative Return",
         color = "Legend"
       ) +
       
@@ -640,7 +652,6 @@ plot_cumulative_returns(
   analysis_title = "Factor Predictors Only"
 )
 
-# <-- MODIFIED: This now plots the "All Predictors" results -->
 # Plot 5: All Predictors
 plot_cumulative_returns(
   predictions_tbl = analysis_output_all$predictions,
@@ -648,25 +659,25 @@ plot_cumulative_returns(
 )
 
 
-#################################################
+############################################
 ### --- 15. Plot Variable Importance --- ###
-#################################################
+############################################
 
 # --- Define a reusable plotting function for variable importance ---
 plot_variable_importance <- function(importance_df, model_title) {
   
-  # Get top 15 variables
-  top_15_vars <- importance_df %>%
+  # Get top 5 variables
+  top_10_vars <- importance_df %>%
     arrange(desc(Importance)) %>%
-    slice_head(n = 15)
+    slice_head(n = 5)
   
   # Create the plot
   print(
-    ggplot(top_15_vars, aes(x = reorder(Variable, Importance), y = Importance)) +
+    ggplot(top_10_vars, aes(x = reorder(Variable, Importance), y = Importance)) +
       geom_col(fill = "steelblue") +
       coord_flip() +
       labs(
-        title = paste("Top 15 Most Important Predictors", model_title),
+        title = paste("Most Important Predictors", model_title),
         x = "Predictor",
         y = "Importance (IncNodePurity / Rel. Inf.)"
       ) +
@@ -674,17 +685,166 @@ plot_variable_importance <- function(importance_df, model_title) {
   )
 }
 
-# <-- MODIFIED: This now plots importance for the "All Predictors" analysis -->
-# --- Plot importance for the "All Predictors" analysis ---
-
-# Random Forest Importance
+# Random Forest Importance (All Factors)
 plot_variable_importance(
-  importance_df = analysis_output_all$importance_rf,
-  model_title = "Random Forest (All Predictors)"
+  importance_df = analysis_output_factors$importance_rf,
+  model_title = "Random Forest (All Factors)"
 )
 
-# Gradient Boosting Importance
+# Gradient Boosting Importance (All Factors)
 plot_variable_importance(
-  importance_df = analysis_output_all$importance_gbm,
-  model_title = "Gradient Boosting (All Predictors)"
+  importance_df = analysis_output_factors$importance_gbm,
+  model_title = "Gradient Boosting (All Factors)"
 )
+
+# Random Forest Importance (Themes)
+plot_variable_importance(
+  importance_df = analysis_output_themes$importance_rf,
+  model_title = "Random Forest (Themes)"
+)
+
+# Gradient Boosting Importance (Themes)
+plot_variable_importance(
+  importance_df = analysis_output_themes$importance_gbm,
+  model_title = "Gradient Boosting (Themes)"
+)
+
+##############################################
+### --- 16. Plot Hyperparameter Tuning --- ###
+##############################################
+
+# --- Define a reusable plotting function for ENET tuning ---
+plot_enet_tuning <- function(tuning_tbl, analysis_title) {
+  
+  # Find the best alpha (excluding 0 and 1)
+  best_enet_alpha <- tuning_tbl %>%
+    filter(alpha > 0, alpha < 1) %>%
+    filter(Validation_MSE == min(Validation_MSE)) %>%
+    pull(alpha)
+  
+  # Get the MSE for Ridge and Lasso
+  ridge_mse <- tuning_tbl %>% filter(alpha == 0) %>% pull(Validation_MSE)
+  lasso_mse <- tuning_tbl %>% filter(alpha == 1) %>% pull(Validation_MSE)
+  
+  print(
+    ggplot(tuning_tbl, aes(x = alpha, y = Validation_MSE)) +
+      geom_line() +
+      geom_point(size = 2) +
+      
+      # <-- MODIFIED: Use annotate() to fix warnings -->
+      # Highlight Ridge
+      annotate("point", x = 0, y = ridge_mse, color = "darkorange", size = 4) +
+      annotate("text", x = 0.05, y = ridge_mse, label = "Ridge", hjust = 0, color = "darkorange") +
+      
+      # Highlight Lasso
+      annotate("point", x = 1, y = lasso_mse, color = "firebrick", size = 4) +
+      annotate("text", x = 0.95, y = lasso_mse, label = "Lasso", hjust = 1, color = "firebrick") +
+      
+      # Highlight Best Elastic Net
+      geom_vline(xintercept = best_enet_alpha, linetype = "dashed", color = "red") +
+      
+      labs(
+        title = "Elastic Net Tuning (Validation Set MSE vs. Alpha)",
+        subtitle = paste("Analysis:", analysis_title),
+        x = "Alpha (0 = Ridge, 1 = Lasso)",
+        y = "Validation Set MSE"
+      ) +
+      theme_minimal()
+  )
+}
+
+# --- Plot tuning for the "All Predictors" analysis ---
+plot_enet_tuning(
+  tuning_tbl = analysis_output_all$enet_tuning,
+  analysis_title = "All Predictors"
+)
+
+# Plot tuning for the "FF5 Only" analysis
+plot_enet_tuning(
+  tuning_tbl = analysis_output_ff5$enet_tuning,
+  analysis_title = "FF5 Predictors Only"
+)
+
+
+#################################################
+### --- 17. Plot Lasso Variable Selection --- ###
+#################################################
+
+# We want to visualize how Lasso performs variable selection
+# on the "Themes Only" dataset. We fit a new glmnet model
+# on the *full training set* (train + validation) to get a stable path.
+
+
+# 1. Combine Train + Validation data for a richer plot
+# We use the full 75% of data designated for training/tuning
+x_train_val_full <- rbind(x_train_full, x_val_full)
+y_train_val      <- c(y_train, y_val)
+
+# 2. Subset to just the "Themes" predictors
+x_train_val_themes <- x_train_val_full[, theme_predictors_lagged, drop = FALSE]
+
+# 3. Fit the Lasso (alpha=1) model
+# We let glmnet create its full sequence of lambdas
+lasso_path_model <- glmnet(
+  x_train_val_themes,
+  y_train_val,
+  alpha = 1,
+  family = "gaussian"
+)
+
+# 4. Create the coefficient path plot
+# label = TRUE adds the variable names (theme names) to the plot
+plot(lasso_path_model, xvar = "lambda", label = TRUE)
+title(
+  main = "Lasso Coefficient Path (Themes Predictors)", 
+  line = 2.5
+)
+
+#################################################
+### --- 17. Plot RF Hyperparameter Tuning --- ###
+#################################################
+
+# --- Define a reusable plotting function for RF mtry tuning ---
+plot_rf_tuning <- function(tuning_tbl, analysis_title) {
+  
+  # Find the best mtry
+  best_rf_mtry <- tuning_tbl %>%
+    filter(Validation_MSE == min(Validation_MSE)) %>%
+    pull(mtry)
+  
+  print(
+    ggplot(tuning_tbl, aes(x = mtry, y = Validation_MSE)) +
+      geom_line() +
+      geom_point(size = 2) +
+      
+      # Highlight Best mtry
+      geom_vline(xintercept = best_rf_mtry, linetype = "dashed", color = "forestgreen") +
+      
+      labs(
+        title = "Random Forest Tuning (Validation Set MSE vs. mtry)",
+        subtitle = paste("Analysis:", analysis_title),
+        x = "mtry (Number of variables per split)",
+        y = "Validation Set MSE"
+      ) +
+      theme_minimal()
+  )
+}
+
+# --- Plot tuning for the "FF5 Only" analysis ---
+plot_rf_tuning(
+  tuning_tbl = analysis_output_ff5$rf_tuning,
+  analysis_title = "FF5 Predictors Only"
+)
+
+# --- Plot tuning for the "All Factors" analysis ---
+plot_rf_tuning(
+  tuning_tbl = analysis_output_factors$rf_tuning,
+  analysis_title = "All Factors"
+)
+
+# --- Plot tuning for the "All Themes" analysis ---
+plot_rf_tuning(
+  tuning_tbl = analysis_output_themes$rf_tuning,
+  analysis_title = "All Themes"
+)
+
