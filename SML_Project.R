@@ -12,7 +12,8 @@ all_packages <- c(
   "randomForest",
   "gbm",
   "nnet",
-  "tibble"
+  "tibble",
+  "corrplot"
 )
 
 options(repos = "https://cloud.r-project.org")
@@ -848,3 +849,52 @@ plot_rf_tuning(
   analysis_title = "All Themes"
 )
 
+
+#########################################
+### --- 18. Plot Correlation Matrices --- ###
+#########################################
+
+# --- Define a reusable plotting function ---
+plot_correlation_matrix <- function(data, title) {
+  
+  # 1. Compute Correlation Matrix
+  # We remove the 'date' column and use only numeric columns
+  cor_matrix <- cor(data %>% select(-date), use = "pairwise.complete.obs")
+  
+  # 2. Plot Upper Triangle
+  # 'tl.cex' controls text size (smaller for large matrices)
+  # 'tl.col' makes text black
+  # 'type="upper"' shows only the upper triangle
+  
+  corrplot(cor_matrix, 
+           method = "color", 
+           type = "upper", 
+           order = "hclust", # Group correlated variables together
+           tl.col = "black", 
+           tl.srt = 45, 
+           title = title,
+           mar = c(0,0,2,0), # Add margin for title
+           tl.cex = 0.6      # Make labels smaller to fit
+  )
+}
+
+# --- 1. FF5 Factors Correlation ---
+# We use the original monthly data (before lagging)
+plot_correlation_matrix(
+  data = factors_ff5_monthly, 
+  title = "Correlation: Fama-French 5 Factors"
+)
+
+# --- 2. All Themes Correlation ---
+plot_correlation_matrix(
+  data = all_themes_wide, 
+  title = "Correlation: All 13 Themes"
+)
+
+# --- 3. All Factors Correlation ---
+# This will be a very large plot (153x153)
+# We might need to make the text extremely small or remove it
+plot_correlation_matrix(
+  data = all_factors_wide, 
+  title = "Correlation: All 153 Factors"
+)
